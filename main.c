@@ -2,6 +2,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <termios.h>
 #include <uv.h>
 
 #include "packet.h"
@@ -17,7 +18,8 @@
 	{}
 #endif
 
-#define BUF_SIZE 1024
+#define BUF_SIZE     1024
+#define SERIAL_SPEED B115200
 
 static char tty_file_path_buf[64];
 static char tty_file_buf[64];
@@ -96,7 +98,21 @@ void check_tty_file(uv_fs_t* req) {
 	if(req->result >= 0) {
 		// 文件存在并已被打开
 		fd = req->result;
+		struct termios opt;
+
+		tcflush(fd, TCIOFLUSH);
+		tcgetattr(fd, &opt);
+
+		cfsetospeed(&opt, SERIAL_SPEED);
+		cfsetispeed(&opt, SERIAL_SPEED);
+		opt.c_cflag &= ~CSIZE;
+		opt.c_cflag |= CS8;
+		opt.c_cflag &= ~PARENB;
+		opt.c_cflag &= ~INPCK;
+		opt.c_cflag &= ~CSTOPB;
+		tcsetattr(fd, TCSANOW, &opt);
 		fprintf(stdout, "[info] serial opened\n");
+
 		uv_poll_init(uv_default_loop(), &poll_handle, fd);
 		uv_poll_start(&poll_handle, UV_READABLE, on_poll);
 		DEBUG("start polling\n");
@@ -106,6 +122,7 @@ void check_tty_file(uv_fs_t* req) {
 		if(fd >= 0) {
 			uv_poll_stop(&poll_handle);
 			uv_close((uv_handle_t*)&poll_handle, NULL);
+
 			uv_fs_t close_req;
 			uv_fs_close(uv_default_loop(), &close_req, fd,
 			            NULL);
@@ -157,7 +174,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	// 添加前缀目录
-	char* tty_file_prefix = "/tmp";
+	char* tty_file_prefix = "/dev";
 	sprintf(tty_file_path_buf, "%s/%s", tty_file_prefix,
 	        tty_file);
 	strcpy(tty_file_buf, tty_file);
@@ -176,7 +193,8 @@ int main(int argc, char* argv[]) {
 	// 在一开始就有目标文件时, 文件状态不会变化
 	// 手动打开读取
 	uv_fs_open(uv_default_loop(), &open_req,
-	           tty_file_path_buf, O_RDONLY | O_NONBLOCK, 0,
+	           tty_file_path_buf,
+	           O_RDONLY | O_NOCTTY | O_NONBLOCK, 0,
 	           check_tty_file);
 
 	uv_run(uv_default_loop(), UV_RUN_DEFAULT);
