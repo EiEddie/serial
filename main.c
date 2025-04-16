@@ -1,6 +1,8 @@
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 #include <unistd.h>
 #include <termios.h>
 #include <uv.h>
@@ -18,14 +20,24 @@
 	{}
 #endif
 
+
 #define BUF_SIZE     1024
 #define SERIAL_SPEED B115200
 
 static char tty_file_path_buf[64];
 static char tty_file_buf[64];
-static uv_fs_t open_req;
-static int fd = -ENOENT;
-static uv_poll_t poll_handle;
+
+typedef struct {
+	uv_loop_t* loop;
+
+	uv_fs_t open_req;
+	uv_fs_t close_req;
+	int fd;
+
+	uv_fs_event_t event_handle;
+	uv_poll_t poll_handle;
+	uv_signal_t signal_handle;
+} context_t;
 
 
 typedef struct {
@@ -38,6 +50,12 @@ typedef struct {
 void check_tty_file(uv_fs_t* req);
 
 
+void on_fs_close(uv_fs_t* req) {
+	((context_t*)req->data)->fd = -ENOENT;
+	uv_fs_req_cleanup(req);
+}
+
+
 void on_poll(uv_poll_t* handle, int stat, int events) {
 	if(stat < 0) {
 		fprintf(stderr, " [err] %s\n", uv_strerror(stat));
@@ -47,9 +65,11 @@ void on_poll(uv_poll_t* handle, int stat, int events) {
 		return;
 	}
 
+	context_t* ctx = handle->data;
+
 	char rbuf[sizeof(packet_t) + BUF_SIZE];
 	char* rbuf_bg = rbuf + sizeof(packet_t);
-	size_t rsize = read(fd, rbuf_bg, BUF_SIZE);
+	size_t rsize = read(ctx->fd, rbuf_bg, BUF_SIZE);
 	const char* rbuf_ed = rbuf_bg + rsize - 1;
 
 	if(rsize == 0) {
@@ -57,12 +77,9 @@ void on_poll(uv_poll_t* handle, int stat, int events) {
 		uv_poll_stop(handle);
 		uv_close((uv_handle_t*)handle, NULL);
 		DEBUG("stop polling\n");
-		uv_fs_t close_req;
-		uv_fs_close(uv_default_loop(), &close_req, fd,
-		            NULL);
-		uv_fs_req_cleanup(&close_req);
-		fd = -ENOENT;
-		uv_fs_open(uv_default_loop(), &open_req,
+		uv_fs_close(ctx->loop, &ctx->close_req, ctx->fd,
+		            on_fs_close);
+		uv_fs_open(ctx->loop, &ctx->open_req,
 		           tty_file_path_buf, O_RDONLY | O_NONBLOCK,
 		           0, check_tty_file);
 		fprintf(stdout, "[info] close and reopen serial\n");
@@ -95,13 +112,14 @@ void on_poll(uv_poll_t* handle, int stat, int events) {
 
 /// @brief on_open
 void check_tty_file(uv_fs_t* req) {
+	context_t* ctx = req->data;
 	if(req->result >= 0) {
 		// 文件存在并已被打开
-		fd = req->result;
+		ctx->fd = req->result;
 		struct termios opt;
 
-		tcflush(fd, TCIOFLUSH);
-		tcgetattr(fd, &opt);
+		tcflush(ctx->fd, TCIOFLUSH);
+		tcgetattr(ctx->fd, &opt);
 
 		cfsetospeed(&opt, SERIAL_SPEED);
 		cfsetispeed(&opt, SERIAL_SPEED);
@@ -110,24 +128,24 @@ void check_tty_file(uv_fs_t* req) {
 		opt.c_cflag &= ~PARENB;
 		opt.c_cflag &= ~INPCK;
 		opt.c_cflag &= ~CSTOPB;
-		tcsetattr(fd, TCSANOW, &opt);
+		tcsetattr(ctx->fd, TCSANOW, &opt);
 		fprintf(stdout, "[info] serial opened\n");
 
-		uv_poll_init(uv_default_loop(), &poll_handle, fd);
-		uv_poll_start(&poll_handle, UV_READABLE, on_poll);
+		ctx->poll_handle.data = ctx;
+		uv_poll_init(ctx->loop, &ctx->poll_handle, ctx->fd);
+		uv_poll_start(&ctx->poll_handle, UV_READABLE,
+		              on_poll);
 		DEBUG("start polling\n");
 	} else if(req->result == -ENOENT) {
 		// 文件不存在
 		// 说明文件一开始就不存在或被删除
-		if(fd >= 0) {
-			uv_poll_stop(&poll_handle);
-			uv_close((uv_handle_t*)&poll_handle, NULL);
-
-			uv_fs_t close_req;
-			uv_fs_close(uv_default_loop(), &close_req, fd,
-			            NULL);
-			fd = -ENOENT;
-			uv_fs_req_cleanup(&close_req);
+		if(ctx->fd >= 0) {
+			ctx->poll_handle.data = ctx;
+			uv_poll_stop(&ctx->poll_handle);
+			uv_close((uv_handle_t*)&ctx->poll_handle, NULL);
+			ctx->close_req.data = ctx;
+			uv_fs_close(ctx->loop, &ctx->close_req, ctx->fd,
+			            on_fs_close);
 			DEBUG("stop polling and close file\n");
 		}
 		fprintf(stderr, "[warn] serial not found\n");
@@ -155,9 +173,38 @@ void watch_dir(uv_fs_event_t* handle, const char* fname,
 		return;
 	}
 
-	uv_fs_open(uv_default_loop(), &open_req,
-	           tty_file_path_buf, O_RDONLY | O_NONBLOCK, 0,
-	           check_tty_file);
+	context_t* ctx = handle->data;
+	ctx->open_req.data = ctx;
+	uv_fs_open(ctx->loop, &ctx->open_req, tty_file_path_buf,
+	           O_RDONLY | O_NONBLOCK, 0, check_tty_file);
+}
+
+
+void on_close(uv_handle_t* handle) {
+	free(handle->data);
+}
+
+
+void on_signal(uv_signal_t* handle, int _) {
+	context_t* ctx = handle->data;
+
+	if(ctx->fd >= 0) {
+		ctx->poll_handle.data = ctx;
+		uv_poll_stop(&ctx->poll_handle);
+		uv_close((uv_handle_t*)&ctx->poll_handle, NULL);
+		ctx->close_req.data = ctx;
+		uv_fs_close(ctx->loop, &ctx->close_req, ctx->fd,
+		            on_fs_close);
+		DEBUG("stop polling and close file\n");
+	}
+
+	ctx->event_handle.data = ctx;
+	uv_fs_event_stop(&ctx->event_handle);
+	uv_close((uv_handle_t*)&ctx->event_handle, NULL);
+	DEBUG("stop watching\n");
+
+	ctx->signal_handle.data = ctx;
+	uv_close((uv_handle_t*)handle, on_close);
 }
 
 
@@ -181,37 +228,32 @@ int main(int argc, char* argv[]) {
 	tty_file = tty_file_path_buf;
 	fprintf(stdout, "[info] serial path: '%s'\n", tty_file);
 
+	context_t* ctx = (context_t*)malloc(sizeof(context_t));
+	ctx->loop = uv_default_loop();
+	ctx->fd = -ENOENT;
+
+	uv_signal_init(ctx->loop, &ctx->signal_handle);
+	ctx->signal_handle.data = ctx;
+	uv_signal_start(&ctx->signal_handle, on_signal, SIGINT);
+
 	// 监控前缀目录
 	// 当被监视文件状态发生变化, 尝试打开并读取
 	// 如此实现自动重连
-	uv_fs_event_t dir_watcher;
-	uv_fs_event_init(uv_default_loop(), &dir_watcher);
-	uv_fs_event_start(&dir_watcher, watch_dir,
+	ctx->event_handle.data = ctx;
+	uv_fs_event_init(ctx->loop, &ctx->event_handle);
+	uv_fs_event_start(&ctx->event_handle, watch_dir,
 	                  tty_file_prefix, 0);
 	DEBUG("begin watching path: '%s'\n", tty_file_prefix);
 
 	// 在一开始就有目标文件时, 文件状态不会变化
 	// 手动打开读取
-	uv_fs_open(uv_default_loop(), &open_req,
-	           tty_file_path_buf,
+	ctx->open_req.data = ctx;
+	uv_fs_open(ctx->loop, &ctx->open_req, tty_file_path_buf,
 	           O_RDONLY | O_NOCTTY | O_NONBLOCK, 0,
 	           check_tty_file);
 
-	uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+	uv_run(ctx->loop, UV_RUN_DEFAULT);
 
-	if(fd >= 0) {
-		uv_fs_t close_req;
-		uv_fs_close(uv_default_loop(), &close_req, fd,
-		            NULL);
-		fd = -ENOENT;
-		uv_fs_req_cleanup(&close_req);
-		DEBUG("close and clean up serial\n");
-	}
-
-	uv_loop_close(uv_default_loop());
-	uv_fs_event_stop(&dir_watcher);
-	uv_close((uv_handle_t*)&dir_watcher, NULL);
-	DEBUG("stop watching\n");
-	uv_fs_req_cleanup(&open_req);
+	uv_loop_close(ctx->loop);
 	return 0;
 }
