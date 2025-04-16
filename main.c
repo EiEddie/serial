@@ -77,8 +77,10 @@ void on_poll(uv_poll_t* handle, int stat, int events) {
 		uv_poll_stop(handle);
 		uv_close((uv_handle_t*)handle, NULL);
 		DEBUG("stop polling\n");
+		ctx->close_req.data = ctx;
 		uv_fs_close(ctx->loop, &ctx->close_req, ctx->fd,
 		            on_fs_close);
+		ctx->open_req.data = ctx;
 		uv_fs_open(ctx->loop, &ctx->open_req,
 		           tty_file_path_buf, O_RDONLY | O_NONBLOCK,
 		           0, check_tty_file);
@@ -180,11 +182,6 @@ void watch_dir(uv_fs_event_t* handle, const char* fname,
 }
 
 
-void on_close(uv_handle_t* handle) {
-	free(handle->data);
-}
-
-
 void on_signal(uv_signal_t* handle, int _) {
 	context_t* ctx = handle->data;
 
@@ -204,7 +201,7 @@ void on_signal(uv_signal_t* handle, int _) {
 	DEBUG("stop watching\n");
 
 	ctx->signal_handle.data = ctx;
-	uv_close((uv_handle_t*)handle, on_close);
+	uv_close((uv_handle_t*)handle, NULL);
 }
 
 
@@ -255,5 +252,8 @@ int main(int argc, char* argv[]) {
 	uv_run(ctx->loop, UV_RUN_DEFAULT);
 
 	uv_loop_close(ctx->loop);
+	free(ctx);
+	ctx = NULL;
+	fprintf(stdout, "[info] exit\n");
 	return 0;
 }
