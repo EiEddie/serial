@@ -226,7 +226,7 @@ void on_poll_close(uv_handle_t* handle) {
 
 
 void serial_recv_term(context_t* ctx) {
-	if(!ctx->is_recv)
+	if(!ctx->is_recv || ctx->fd < 0)
 		return;
 	ctx->poll_handle.data = ctx;
 	uv_poll_stop(&ctx->poll_handle);
@@ -241,6 +241,9 @@ void serial_close(context_t* ctx) {
 	uv_fs_event_stop(&ctx->event_handle);
 	uv_close((uv_handle_t*)&ctx->event_handle, NULL);
 	DEBUG("stop watching\n");
+
+	if(ctx->fd < 0)
+		return;
 	ctx->close_req.data = ctx;
 	uv_fs_close(ctx->loop, &ctx->close_req, ctx->fd,
 	            on_fs_close);
