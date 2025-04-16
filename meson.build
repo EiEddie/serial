@@ -22,3 +22,5 @@ lib_dep = declare_dependency(include_directories: inc,
 #executable('serial', src,
 #           include_directories: inc,
 #           dependencies: libuv_dep)
+
+subdir('examples/receiver')
