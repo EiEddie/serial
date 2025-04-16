@@ -8,8 +8,7 @@ static uv_signal_t signal_handle;
 
 
 void msg_cb(struct msg_t msg) {
-	printf("\t{msg} a:%d [%x]; b:%d [%x]\n", msg.a, msg.a,
-	       msg.b, msg.b);
+	printf("\t{msg} val:%d [%x]\n", msg.val, msg.val);
 }
 
 
